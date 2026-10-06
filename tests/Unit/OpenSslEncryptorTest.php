@@ -194,4 +194,66 @@ describe('OpenSslEncryptor', function (): void {
 
         $encryptor->decrypt($tampered);
     })->throws(DecryptionException::class);
+
+    it('rejects a payload whose GCM auth tag is truncated to one byte', function (): void {
+        $encryptor = new OpenSslEncryptor(createTestEncryptionConfig());
+        $encrypted = $encryptor->encrypt('secret');
+
+        $json = base64_decode($encrypted, true);
+        $payload = json_decode($json, true);
+        $tag = base64_decode($payload['tag'], true);
+        $payload['tag'] = base64_encode($tag[0]);
+        $tampered = base64_encode(json_encode($payload));
+
+        $encryptor->decrypt($tampered);
+    })->throws(DecryptionException::class, 'Authentication tag must be 16 bytes, got 1');
+
+    it('rejects a forged ciphertext paired with a brute-forced one-byte tag', function (): void {
+        $encryptor = new OpenSslEncryptor(createTestEncryptionConfig());
+        $encrypted = $encryptor->encrypt('secret');
+
+        $json = base64_decode($encrypted, true);
+        $payload = json_decode($json, true);
+        $value = base64_decode($payload['value'], true);
+        $value[0] = chr(ord($value[0]) ^ 0x01);
+        $payload['value'] = base64_encode($value);
+
+        $forged = null;
+
+        for ($byte = 0; $byte < 256; $byte++) {
+            $payload['tag'] = base64_encode(chr($byte));
+
+            try {
+                $forged = $encryptor->decrypt(base64_encode(json_encode($payload)));
+                break;
+            } catch (DecryptionException) {
+                continue;
+            }
+        }
+
+        expect($forged)->toBeNull();
+    });
+
+    it('rejects a payload whose IV length does not match the cipher IV length', function (): void {
+        $encryptor = new OpenSslEncryptor(createTestEncryptionConfig());
+        $encrypted = $encryptor->encrypt('secret');
+
+        $json = base64_decode($encrypted, true);
+        $payload = json_decode($json, true);
+        $payload['iv'] = base64_encode(random_bytes(8));
+        $tampered = base64_encode(json_encode($payload));
+
+        $encryptor->decrypt($tampered);
+    })->throws(DecryptionException::class, 'Initialization vector must be 12 bytes, got 8');
+
+    it('still round-trips a valid payload with a full-length tag and IV', function (): void {
+        $encryptor = new OpenSslEncryptor(createTestEncryptionConfig());
+        $encrypted = $encryptor->encrypt('secret');
+
+        $payload = json_decode(base64_decode($encrypted, true), true);
+
+        expect(strlen(base64_decode($payload['tag'], true)))->toBe(16)
+            ->and(strlen(base64_decode($payload['iv'], true)))->toBe(12)
+            ->and($encryptor->decrypt($encrypted))->toBe('secret');
+    });
 });

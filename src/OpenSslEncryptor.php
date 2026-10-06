@@ -13,6 +13,12 @@ use Random\RandomException;
 
 class OpenSslEncryptor implements EncryptorInterface
 {
+    /**
+     * Full-length AEAD authentication tag. Decryption rejects anything shorter,
+     * because OpenSSL only verifies as many tag bytes as it is given.
+     */
+    private const int TAG_LENGTH = 16;
+
     private readonly string $key;
 
     private readonly string $cipher;
@@ -70,7 +76,16 @@ class OpenSslEncryptor implements EncryptorInterface
         $iv = random_bytes($this->ivLength);
         $tag = '';
 
-        $encrypted = openssl_encrypt($value, $this->cipher, $this->key, OPENSSL_RAW_DATA, $iv, $tag);
+        $encrypted = openssl_encrypt(
+            $value,
+            $this->cipher,
+            $this->key,
+            OPENSSL_RAW_DATA,
+            $iv,
+            $tag,
+            '',
+            self::TAG_LENGTH,
+        );
 
         if ($encrypted === false) {
             throw new EncryptionException(
@@ -128,6 +143,14 @@ class OpenSslEncryptor implements EncryptorInterface
 
         if ($iv === false || $value === false || $tag === false) {
             throw DecryptionException::invalidPayload();
+        }
+
+        if (strlen($iv) !== $this->ivLength) {
+            throw DecryptionException::invalidIvLength(strlen($iv), $this->ivLength);
+        }
+
+        if (strlen($tag) !== self::TAG_LENGTH) {
+            throw DecryptionException::invalidTagLength(strlen($tag), self::TAG_LENGTH);
         }
 
         $decrypted = openssl_decrypt($value, $this->cipher, $this->key, OPENSSL_RAW_DATA, $iv, $tag);
