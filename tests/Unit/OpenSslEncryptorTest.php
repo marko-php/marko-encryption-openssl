@@ -9,9 +9,14 @@ use Marko\Encryption\Exceptions\EncryptionException;
 use Marko\Encryption\OpenSsl\OpenSslEncryptor;
 use Marko\Testing\Fake\FakeConfigRepository;
 
+/**
+ * @param list<string> $previousKeys
+ */
 function createTestEncryptionConfig(
     string $key = '',
     string $cipher = 'aes-256-gcm',
+    array $previousKeys = [],
+    bool $aadFallback = true,
 ): EncryptionConfig {
     if ($key === '') {
         $key = base64_encode(random_bytes(32));
@@ -20,6 +25,8 @@ function createTestEncryptionConfig(
     $repository = new FakeConfigRepository([
         'encryption.key' => $key,
         'encryption.cipher' => $cipher,
+        'encryption.previous_keys' => $previousKeys,
+        'encryption.aad_fallback' => $aadFallback,
     ]);
 
     return new EncryptionConfig($repository);
@@ -256,4 +263,121 @@ describe('OpenSslEncryptor', function (): void {
             ->and(strlen(base64_decode($payload['iv'], true)))->toBe(12)
             ->and($encryptor->decrypt($encrypted))->toBe('secret');
     });
+
+    it('accepts a 16-byte key for aes-128-gcm and round-trips', function (): void {
+        $encryptor = new OpenSslEncryptor(createTestEncryptionConfig(
+            key: base64_encode(random_bytes(16)),
+            cipher: 'aes-128-gcm',
+        ));
+
+        expect($encryptor->decrypt($encryptor->encrypt('secret')))->toBe('secret');
+    });
+
+    it('rejects a 32-byte key for aes-128-gcm instead of silently truncating it', function (): void {
+        new OpenSslEncryptor(createTestEncryptionConfig(
+            key: base64_encode(random_bytes(32)),
+            cipher: 'aes-128-gcm',
+        ));
+    })->throws(EncryptionException::class, 'Invalid encryption key');
+
+    it('names the cipher and required key length when the key length is wrong', function (): void {
+        $exception = null;
+
+        try {
+            new OpenSslEncryptor(createTestEncryptionConfig(
+                key: base64_encode(random_bytes(32)),
+                cipher: 'aes-128-gcm',
+            ));
+        } catch (EncryptionException $e) {
+            $exception = $e;
+        }
+
+        expect($exception)->toBeInstanceOf(EncryptionException::class)
+            ->and($exception->getContext())->toContain('16-byte')
+            ->and($exception->getContext())->toContain('aes-128-gcm')
+            ->and($exception->getSuggestion())->toContain('random_bytes(16)');
+    });
+
+    it('round-trips a value encrypted with associated data', function (): void {
+        $encryptor = new OpenSslEncryptor(createTestEncryptionConfig());
+
+        $encrypted = $encryptor->encrypt('123-45-6789', 'users.ssn');
+
+        expect($encryptor->decrypt($encrypted, 'users.ssn'))->toBe('123-45-6789');
+    });
+
+    it('rejects ciphertext swapped into a field with different associated data', function (): void {
+        $encryptor = new OpenSslEncryptor(createTestEncryptionConfig());
+
+        $encrypted = $encryptor->encrypt('123-45-6789', 'users.ssn');
+
+        $encryptor->decrypt($encrypted, 'users.nickname');
+    })->throws(DecryptionException::class);
+
+    it('rejects ciphertext with associated data when decrypted without it', function (): void {
+        $encryptor = new OpenSslEncryptor(createTestEncryptionConfig());
+
+        $encrypted = $encryptor->encrypt('secret', 'users.ssn');
+
+        $encryptor->decrypt($encrypted);
+    })->throws(DecryptionException::class);
+
+    it('decrypts legacy ciphertext without associated data when aad_fallback is on', function (): void {
+        $encryptor = new OpenSslEncryptor(createTestEncryptionConfig(aadFallback: true));
+
+        $legacy = $encryptor->encrypt('secret');
+
+        expect($encryptor->decrypt($legacy, 'users.ssn'))->toBe('secret');
+    });
+
+    it('rejects legacy ciphertext without associated data when aad_fallback is off', function (): void {
+        $encryptor = new OpenSslEncryptor(createTestEncryptionConfig(aadFallback: false));
+
+        $legacy = $encryptor->encrypt('secret');
+
+        $encryptor->decrypt($legacy, 'users.ssn');
+    })->throws(DecryptionException::class);
+
+    it('decrypts ciphertext written with a previous key', function (): void {
+        $oldKey = base64_encode(random_bytes(32));
+        $old = new OpenSslEncryptor(createTestEncryptionConfig(key: $oldKey));
+        $rotated = new OpenSslEncryptor(createTestEncryptionConfig(previousKeys: [$oldKey]));
+
+        expect($rotated->decrypt($old->encrypt('secret')))->toBe('secret')
+            ->and($rotated->decrypt($old->encrypt('secret', 'users.ssn'), 'users.ssn'))->toBe('secret');
+    });
+
+    it('decrypts legacy ciphertext from a previous key via aad_fallback', function (): void {
+        $oldKey = base64_encode(random_bytes(32));
+        $old = new OpenSslEncryptor(createTestEncryptionConfig(key: $oldKey));
+        $rotated = new OpenSslEncryptor(createTestEncryptionConfig(previousKeys: [$oldKey]));
+
+        expect($rotated->decrypt($old->encrypt('secret'), 'users.ssn'))->toBe('secret');
+    });
+
+    it('encrypts with the current key only, never a previous key', function (): void {
+        $oldKey = base64_encode(random_bytes(32));
+        $old = new OpenSslEncryptor(createTestEncryptionConfig(key: $oldKey));
+        $rotated = new OpenSslEncryptor(createTestEncryptionConfig(previousKeys: [$oldKey]));
+
+        $old->decrypt($rotated->encrypt('secret'));
+    })->throws(DecryptionException::class);
+
+    it('rejects ciphertext from a key that is neither current nor previous', function (): void {
+        $stranger = new OpenSslEncryptor(createTestEncryptionConfig());
+        $rotated = new OpenSslEncryptor(createTestEncryptionConfig(previousKeys: [base64_encode(random_bytes(32))]));
+
+        $rotated->decrypt($stranger->encrypt('secret'));
+    })->throws(DecryptionException::class, 'The encryption key is invalid or does not match');
+
+    it('throws at construction when a previous key has the wrong length for the cipher', function (): void {
+        new OpenSslEncryptor(createTestEncryptionConfig(previousKeys: [
+            base64_encode(random_bytes(32)),
+            base64_encode(random_bytes(16)),
+        ]));
+    })->throws(EncryptionException::class, 'Invalid previous encryption key at index 1');
+
+    it('throws at construction when a previous key is not valid base64', function (): void {
+        new OpenSslEncryptor(createTestEncryptionConfig(previousKeys: ['not base64!!']));
+    })->throws(EncryptionException::class, 'Invalid previous encryption key at index 0');
 });

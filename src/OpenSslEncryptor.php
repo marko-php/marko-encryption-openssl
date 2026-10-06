@@ -21,6 +21,15 @@ class OpenSslEncryptor implements EncryptorInterface
 
     private readonly string $key;
 
+    /**
+     * Retired keys, tried for decryption only, in configured order.
+     *
+     * @var list<string>
+     */
+    private readonly array $previousKeys;
+
+    private readonly bool $aadFallback;
+
     private readonly string $cipher;
 
     private readonly int $ivLength;
@@ -31,18 +40,6 @@ class OpenSslEncryptor implements EncryptorInterface
     public function __construct(
         private readonly EncryptionConfig $config,
     ) {
-        $key = base64_decode($this->config->key(), true);
-
-        if ($key === false || strlen($key) !== 32) {
-            throw new EncryptionException(
-                message: 'Invalid encryption key',
-                context: 'The ENCRYPTION_KEY must be a base64-encoded 32-byte key',
-                suggestion: 'Generate a key with: base64_encode(random_bytes(32))',
-            );
-        }
-
-        $this->key = $key;
-
         $cipher = strtolower($this->config->cipher());
 
         if (!in_array($cipher, openssl_get_cipher_methods(), true)) {
@@ -54,15 +51,37 @@ class OpenSslEncryptor implements EncryptorInterface
         }
 
         $ivLength = openssl_cipher_iv_length($cipher);
+        $keyLength = openssl_cipher_key_length($cipher);
 
-        if ($ivLength === false) {
+        if ($ivLength === false || $keyLength === false) {
             throw new EncryptionException(
-                message: "Failed to determine IV length for cipher '$cipher'",
+                message: "Failed to determine IV or key length for cipher '$cipher'",
                 context: 'Initializing OpenSSL encryptor at construction',
                 suggestion: 'Ensure the cipher is supported by the installed OpenSSL version',
             );
         }
 
+        $key = $this->decodeKey($this->config->key(), $keyLength);
+
+        if ($key === null) {
+            throw EncryptionException::invalidKeyLength($cipher, $keyLength);
+        }
+
+        $previousKeys = [];
+
+        foreach ($this->config->previousKeys() as $index => $previousKey) {
+            $decoded = $this->decodeKey($previousKey, $keyLength);
+
+            if ($decoded === null) {
+                throw EncryptionException::invalidPreviousKey($index, $cipher, $keyLength);
+            }
+
+            $previousKeys[] = $decoded;
+        }
+
+        $this->key = $key;
+        $this->previousKeys = $previousKeys;
+        $this->aadFallback = $this->config->aadFallback();
         $this->cipher = $cipher;
         $this->ivLength = $ivLength;
     }
@@ -72,6 +91,7 @@ class OpenSslEncryptor implements EncryptorInterface
      */
     public function encrypt(
         string $value,
+        string $aad = '',
     ): string {
         $iv = random_bytes($this->ivLength);
         $tag = '';
@@ -83,7 +103,7 @@ class OpenSslEncryptor implements EncryptorInterface
             OPENSSL_RAW_DATA,
             $iv,
             $tag,
-            '',
+            $aad,
             self::TAG_LENGTH,
         );
 
@@ -114,10 +134,15 @@ class OpenSslEncryptor implements EncryptorInterface
     }
 
     /**
+     * Decrypt with the current key, then each previous key. When that fails for a
+     * non-empty $aad and encryption.aad_fallback is on, every key is retried with
+     * empty associated data so values written before AAD was introduced still decrypt.
+     *
      * @throws DecryptionException
      */
     public function decrypt(
         string $encrypted,
+        string $aad = '',
     ): string {
         $json = base64_decode($encrypted, true);
 
@@ -153,12 +178,30 @@ class OpenSslEncryptor implements EncryptorInterface
             throw DecryptionException::invalidTagLength(strlen($tag), self::TAG_LENGTH);
         }
 
-        $decrypted = openssl_decrypt($value, $this->cipher, $this->key, OPENSSL_RAW_DATA, $iv, $tag);
+        $aadCandidates = $aad !== '' && $this->aadFallback ? [$aad, ''] : [$aad];
 
-        if ($decrypted === false) {
-            throw DecryptionException::invalidKey();
+        foreach ($aadCandidates as $candidateAad) {
+            foreach ([$this->key, ...$this->previousKeys] as $key) {
+                $decrypted = openssl_decrypt($value, $this->cipher, $key, OPENSSL_RAW_DATA, $iv, $tag, $candidateAad);
+
+                if ($decrypted !== false) {
+                    return $decrypted;
+                }
+            }
         }
 
-        return $decrypted;
+        throw DecryptionException::invalidKey();
+    }
+
+    /**
+     * Decode a base64 key, or null when it is not valid base64 or not exactly $length bytes.
+     */
+    private function decodeKey(
+        string $encoded,
+        int $length,
+    ): ?string {
+        $key = base64_decode($encoded, true);
+
+        return $key !== false && strlen($key) === $length ? $key : null;
     }
 }
